@@ -9,13 +9,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ags-slc/pg-schema-diff/internal/schema"
+	externalschema "github.com/ags-slc/pg-schema-diff/pkg/schema"
 	_ "github.com/jackc/pgx/v4/stdlib"
 	"github.com/kr/pretty"
-	"github.com/stripe/pg-schema-diff/internal/schema"
-	externalschema "github.com/stripe/pg-schema-diff/pkg/schema"
 
-	"github.com/stripe/pg-schema-diff/pkg/log"
-	"github.com/stripe/pg-schema-diff/pkg/tempdb"
+	"github.com/ags-slc/pg-schema-diff/pkg/log"
+	"github.com/ags-slc/pg-schema-diff/pkg/tempdb"
 )
 
 const (
@@ -181,6 +181,7 @@ func Generate(
 }
 
 func generateMigrationStatements(oldSchema, newSchema schema.Schema, planOptions *planOptions) ([]Statement, error) {
+	oldSchema, newSchema = withoutPartitionPrivileges(oldSchema), withoutPartitionPrivileges(newSchema)
 	diff, _, err := buildSchemaDiff(oldSchema, newSchema)
 	if err != nil {
 		return nil, err
@@ -224,6 +225,11 @@ func assertValidPlan(ctx context.Context,
 	// on the database.
 	setMaxConnectionsIfNotSet(tempDb.ConnPool, tempDbMaxConnections)
 
+	// A partition's own check constraints and policies cannot be built from
+	// scratch -- Add refuses them -- and the plan has already refused any change
+	// to them, so they are identical on both sides. Leave them out of the
+	// rebuild and of the comparison.
+	currentSchema, newSchema = withoutPartitionCheckConstraintsAndPolicies(currentSchema), withoutPartitionCheckConstraintsAndPolicies(newSchema)
 	if err := setSchemaForEmptyDatabase(ctx, tempDb, currentSchema, planOptions); err != nil {
 		return fmt.Errorf("inserting schema in temporary database: %w", err)
 	}
@@ -237,7 +243,7 @@ func assertValidPlan(ctx context.Context,
 		return fmt.Errorf("fetching schema from migrated database: %w", err)
 	}
 
-	return assertMigratedSchemaMatchesTarget(migratedSchema, newSchema, planOptions)
+	return assertMigratedSchemaMatchesTarget(withoutPartitionCheckConstraintsAndPolicies(migratedSchema), newSchema, planOptions)
 }
 
 func setMaxConnectionsIfNotSet(db *sql.DB, defaultMax int) {
@@ -277,6 +283,38 @@ func setSchemaForEmptyDatabase(ctx context.Context, emptyDb *tempdb.Database, ta
 
 func schemaFromTempDb(ctx context.Context, db *tempdb.Database, plan *planOptions) (schema.Schema, error) {
 	return schema.GetSchema(ctx, db.ConnPool, append(plan.getSchemaOpts, db.ExcludeMetadataOptions...)...)
+}
+
+// withoutPartitionPrivileges returns a copy of the schema with the privileges
+// of every partition cleared. Privileges on partitions are not managed:
+// PostgreSQL does not carry a parent's GRANT to its partitions, so whatever
+// creates them -- pg_partman's inherit_privileges, a trigger, a script -- owns
+// their grants. Clearing them on both sides means a partition's grants never
+// appear in a plan and never block one.
+func withoutPartitionPrivileges(s schema.Schema) schema.Schema {
+	tables := make([]schema.Table, len(s.Tables))
+	for i, t := range s.Tables {
+		if t.IsPartition() {
+			t.Privileges = nil
+		}
+		tables[i] = t
+	}
+	s.Tables = tables
+	return s
+}
+
+// withoutPartitionCheckConstraintsAndPolicies returns a copy of the schema
+// with every partition's check constraints and policies cleared.
+func withoutPartitionCheckConstraintsAndPolicies(s schema.Schema) schema.Schema {
+	tables := make([]schema.Table, len(s.Tables))
+	for i, t := range s.Tables {
+		if t.IsPartition() {
+			t.CheckConstraints, t.Policies = nil, nil
+		}
+		tables[i] = t
+	}
+	s.Tables = tables
+	return s
 }
 
 // clearTablePrivileges returns a copy of the schema with all table privileges cleared.

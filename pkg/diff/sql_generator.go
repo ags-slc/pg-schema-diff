@@ -9,9 +9,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ags-slc/pg-schema-diff/internal/pgidentifier"
+	"github.com/ags-slc/pg-schema-diff/internal/schema"
 	"github.com/google/go-cmp/cmp"
-	"github.com/stripe/pg-schema-diff/internal/pgidentifier"
-	"github.com/stripe/pg-schema-diff/internal/schema"
+	"github.com/google/go-cmp/cmp/cmpopts"
 )
 
 const (
@@ -809,9 +810,6 @@ func (t *tableSQLVertexGenerator) Add(table schema.Table) ([]Statement, error) {
 		if len(table.Policies) > 0 {
 			return nil, fmt.Errorf("policies on partitions: %w", ErrNotImplemented)
 		}
-		if len(table.Privileges) > 0 {
-			return nil, fmt.Errorf("privileges on partitions: %w", ErrNotImplemented)
-		}
 		// We attach the partitions separately. So the partition must have all the same check constraints
 		// as the original table
 		table.CheckConstraints = append(table.CheckConstraints, t.tablesInNewSchemaByName[table.ParentTable.GetName()].CheckConstraints...)
@@ -1064,18 +1062,13 @@ func (t *tableSQLVertexGenerator) alterPartition(diff tableDiff) ([]Statement, e
 	if diff.old.ForValues != diff.new.ForValues {
 		return nil, fmt.Errorf("altering partition FOR VALUES: %w", ErrNotImplemented)
 	}
-	if !diff.checkConstraintDiff.isEmpty() {
+	if listChanged(diff.checkConstraintDiff) {
 		return nil, fmt.Errorf("check constraints on partitions: %w", ErrNotImplemented)
 	}
-	if !diff.policiesDiff.isEmpty() {
+	if listChanged(diff.policiesDiff) {
 		// Policy diffing on individual partitions cannot be supported until where a SQL statement is generated is
 		// _independent_ of how it is ordered.
 		return nil, fmt.Errorf("policies on partitions: %w", ErrNotImplemented)
-	}
-	if !diff.privilegesDiff.isEmpty() {
-		// Privilege diffing on individual partitions cannot be supported until where a SQL statement is generated is
-		// _independent_ of how it is ordered.
-		return nil, fmt.Errorf("privileges on partitions: %w", ErrNotImplemented)
 	}
 
 	var alteredParentColumnsByName map[string]columnDiff
@@ -2229,7 +2222,7 @@ func (csg *checkConstraintSQLVertexGenerator) GetDeleteDependencies(con schema.C
 		for _, tc := range targetColumns {
 			deps = append(deps, mustRun(csg.GetSQLVertexId(con, diffTypeDelete)).before(buildColumnVertexId(tc.Name, diffTypeAddAlter)))
 			// This is a weird quirk of our graph system, where if a -> b and b -> c and b does-not-exist, b will be
-			// implicitly created s.t. a -> b -> c (https://github.com/stripe/pg-schema-diff/issues/84)
+			// implicitly created s.t. a -> b -> c (https://github.com/ags-slc/pg-schema-diff/issues/84)
 			//
 			// In this case, "a" is the deletion of the check constraint, "b" is the deletion of
 			// the column, and "c" is the alter/addition of the column. We do not want this behavior. We only want
@@ -2856,4 +2849,23 @@ func columnIdentityTypeToModifier(val schema.ColumnIdentityType) (string, error)
 	default:
 		return "", fmt.Errorf("unknown identity type %q", val)
 	}
+}
+
+// listChanged reports a real change in a list diff. diffLists records every
+// name-matched pair as an alter -- unchanged ones included -- so isEmpty() is
+// false whenever both sides hold the same element; an alter counts only when
+// its two sides differ.
+func listChanged[S schema.Object, D interface {
+	GetOld() S
+	GetNew() S
+}](d listDiff[S, D]) bool {
+	if len(d.adds) > 0 || len(d.deletes) > 0 {
+		return true
+	}
+	for _, a := range d.alters {
+		if !cmp.Equal(a.GetOld(), a.GetNew(), cmpopts.EquateEmpty()) {
+			return true
+		}
+	}
+	return false
 }
